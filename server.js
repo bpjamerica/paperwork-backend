@@ -1,18 +1,16 @@
-// server.js - Node.js Backend for Paperwork Tracker
+// server.js - Node.js Backend for Paperwork Tracker v2
+// Features: Status tracking, Completion, Multiple returns per customer
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Initialize SQLite Database
 const db = new sqlite3.Database('./paperwork.db', (err) => {
     if (err) {
         console.error('Database connection error:', err);
@@ -22,7 +20,6 @@ const db = new sqlite3.Database('./paperwork.db', (err) => {
     }
 });
 
-// Create tables if they don't exist
 function initDatabase() {
     db.run(`
         CREATE TABLE IF NOT EXISTS users (
@@ -39,9 +36,11 @@ function initDatabase() {
             customer_no TEXT NOT NULL,
             order_ids TEXT,
             current_holder TEXT NOT NULL,
+            status TEXT DEFAULT 'active',
+            completed_by TEXT,
+            completed_at DATETIME,
             last_scan DATETIME DEFAULT CURRENT_TIMESTAMP,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(company, customer_no)
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
 
@@ -56,62 +55,61 @@ function initDatabase() {
         )
     `);
 
+    // Add columns for existing databases
+    db.run(`ALTER TABLE paperwork ADD COLUMN status TEXT DEFAULT 'active'`, () => {});
+    db.run(`ALTER TABLE paperwork ADD COLUMN completed_by TEXT`, () => {});
+    db.run(`ALTER TABLE paperwork ADD COLUMN completed_at DATETIME`, () => {});
+
     console.log('Database initialized');
 }
-
-// API Routes
 
 // Get all users
 app.get('/api/users', (req, res) => {
     db.all('SELECT name FROM users ORDER BY name', [], (err, rows) => {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
+        if (err) return res.status(500).json({ error: err.message });
         res.json(rows.map(row => row.name));
     });
 });
 
-// Add or get user
+// Add user
 app.post('/api/users', (req, res) => {
     const { name } = req.body;
-    
-    if (!name || !name.trim()) {
-        res.status(400).json({ error: 'Name is required' });
-        return;
-    }
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
 
     db.run('INSERT OR IGNORE INTO users (name) VALUES (?)', [name.trim()], (err) => {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
+        if (err) return res.status(500).json({ error: err.message });
         res.json({ name: name.trim() });
     });
 });
 
-// Get all paperwork with history
+// Get all paperwork
 app.get('/api/paperwork', (req, res) => {
-    // First get all paperwork
-    db.all('SELECT * FROM paperwork ORDER BY last_scan DESC', [], (err, paperworkRows) => {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
+    const { status, customer_no } = req.query;
+    
+    let query = 'SELECT * FROM paperwork';
+    let params = [];
+    let conditions = [];
 
-        if (paperworkRows.length === 0) {
-            res.json([]);
-            return;
-        }
+    if (status) {
+        conditions.push('status = ?');
+        params.push(status);
+    }
+    if (customer_no) {
+        conditions.push('customer_no = ?');
+        params.push(customer_no);
+    }
+    if (conditions.length > 0) {
+        query += ' WHERE ' + conditions.join(' AND ');
+    }
+    query += ' ORDER BY created_at DESC';
 
-        // Get all history
+    db.all(query, params, (err, paperworkRows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (paperworkRows.length === 0) return res.json([]);
+
         db.all('SELECT * FROM scan_history ORDER BY timestamp ASC', [], (err, historyRows) => {
-            if (err) {
-                res.status(500).json({ error: err.message });
-                return;
-            }
+            if (err) return res.status(500).json({ error: err.message });
 
-            // Map history to paperwork
             const paperwork = paperworkRows.map(row => {
                 const history = historyRows
                     .filter(h => h.paperwork_id === row.id)
@@ -127,6 +125,9 @@ app.get('/api/paperwork', (req, res) => {
                     customer_no: row.customer_no,
                     order_ids: row.order_ids ? JSON.parse(row.order_ids) : [],
                     current_holder: row.current_holder,
+                    status: row.status || 'active',
+                    completed_by: row.completed_by,
+                    completed_at: row.completed_at,
                     last_scan: row.last_scan,
                     created: row.created_at,
                     history: history
@@ -138,172 +139,150 @@ app.get('/api/paperwork', (req, res) => {
     });
 });
 
-// Get single paperwork by ID
-app.get('/api/paperwork/:id', (req, res) => {
+// Create new paperwork (scan creates new document each time)
+app.post('/api/scan', (req, res) => {
+    const { company, customer_no, order_ids, user } = req.body;
+
+    if (!company || !customer_no || !user) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const timestamp = new Date().toISOString();
+
+    // Always create new document (allows multiple returns per customer)
+    db.run(
+        'INSERT INTO paperwork (company, customer_no, order_ids, current_holder, status, last_scan) VALUES (?, ?, ?, ?, ?, ?)',
+        [company, customer_no, JSON.stringify(order_ids || []), user, 'active', timestamp],
+        function(err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            const paperworkId = this.lastID;
+
+            db.run(
+                'INSERT INTO scan_history (paperwork_id, user_name, timestamp, action) VALUES (?, ?, ?, ?)',
+                [paperworkId, user, timestamp, 'created'],
+                (err) => {
+                    if (err) return res.status(500).json({ error: err.message });
+                    res.json({ 
+                        success: true, 
+                        paperworkId,
+                        message: 'New return created',
+                        company,
+                        customer_no,
+                        order_ids: order_ids || []
+                    });
+                }
+            );
+        }
+    );
+});
+
+// Transfer paperwork to another user (scan existing document)
+app.post('/api/paperwork/:id/transfer', (req, res) => {
     const { id } = req.params;
+    const { user } = req.body;
+
+    if (!user) return res.status(400).json({ error: 'User is required' });
+
+    const timestamp = new Date().toISOString();
 
     db.get('SELECT * FROM paperwork WHERE id = ?', [id], (err, row) => {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ error: 'Paperwork not found' });
+        if (row.status === 'completed') return res.status(400).json({ error: 'Cannot transfer completed paperwork' });
 
-        if (!row) {
-            res.status(404).json({ error: 'Paperwork not found' });
-            return;
-        }
+        db.run(
+            'UPDATE paperwork SET current_holder = ?, last_scan = ? WHERE id = ?',
+            [user, timestamp, id],
+            (err) => {
+                if (err) return res.status(500).json({ error: err.message });
 
-        // Get history for this paperwork
-        db.all(
-            'SELECT * FROM scan_history WHERE paperwork_id = ? ORDER BY timestamp ASC',
-            [id],
-            (err, historyRows) => {
-                if (err) {
-                    res.status(500).json({ error: err.message });
-                    return;
-                }
-
-                const history = historyRows.map(h => ({
-                    user: h.user_name,
-                    timestamp: h.timestamp,
-                    action: h.action || 'scanned'
-                }));
-
-                res.json({
-                    id: row.id.toString(),
-                    company: row.company,
-                    customer_no: row.customer_no,
-                    order_ids: row.order_ids ? JSON.parse(row.order_ids) : [],
-                    current_holder: row.current_holder,
-                    last_scan: row.last_scan,
-                    created: row.created_at,
-                    history: history
-                });
+                db.run(
+                    'INSERT INTO scan_history (paperwork_id, user_name, timestamp, action) VALUES (?, ?, ?, ?)',
+                    [id, user, timestamp, 'transferred'],
+                    (err) => {
+                        if (err) return res.status(500).json({ error: err.message });
+                        res.json({ success: true, message: 'Paperwork transferred' });
+                    }
+                );
             }
         );
     });
 });
 
-// Scan paperwork (create or update)
-app.post('/api/scan', (req, res) => {
-    const { company, customer_no, order_ids, user } = req.body;
+// Complete paperwork
+app.post('/api/paperwork/:id/complete', (req, res) => {
+    const { id } = req.params;
+    const { user } = req.body;
 
-    if (!company || !customer_no || !user) {
-        res.status(400).json({ error: 'Missing required fields' });
-        return;
-    }
+    if (!user) return res.status(400).json({ error: 'User is required' });
 
     const timestamp = new Date().toISOString();
 
-    // Check if paperwork exists
-    db.get(
-        'SELECT id FROM paperwork WHERE company = ? AND customer_no = ?',
-        [company, customer_no],
-        (err, row) => {
-            if (err) {
-                res.status(500).json({ error: err.message });
-                return;
-            }
+    db.get('SELECT * FROM paperwork WHERE id = ?', [id], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ error: 'Paperwork not found' });
+        if (row.status === 'completed') return res.status(400).json({ error: 'Already completed' });
 
-            if (row) {
-                // Update existing paperwork
-                const paperworkId = row.id;
-                
+        db.run(
+            'UPDATE paperwork SET status = ?, completed_by = ?, completed_at = ?, last_scan = ? WHERE id = ?',
+            ['completed', user, timestamp, timestamp, id],
+            (err) => {
+                if (err) return res.status(500).json({ error: err.message });
+
                 db.run(
-                    'UPDATE paperwork SET current_holder = ?, last_scan = ? WHERE id = ?',
-                    [user, timestamp, paperworkId],
+                    'INSERT INTO scan_history (paperwork_id, user_name, timestamp, action) VALUES (?, ?, ?, ?)',
+                    [id, user, timestamp, 'completed'],
                     (err) => {
-                        if (err) {
-                            res.status(500).json({ error: err.message });
-                            return;
-                        }
-
-                        // Add to history
-                        db.run(
-                            'INSERT INTO scan_history (paperwork_id, user_name, timestamp) VALUES (?, ?, ?)',
-                            [paperworkId, user, timestamp],
-                            (err) => {
-                                if (err) {
-                                    res.status(500).json({ error: err.message });
-                                    return;
-                                }
-                                res.json({ 
-                                    success: true, 
-                                    paperworkId,
-                                    message: 'Paperwork updated',
-                                    company,
-                                    customer_no,
-                                    order_ids: order_ids || []
-                                });
-                            }
-                        );
-                    }
-                );
-            } else {
-                // Create new paperwork
-                db.run(
-                    'INSERT INTO paperwork (company, customer_no, order_ids, current_holder, last_scan) VALUES (?, ?, ?, ?, ?)',
-                    [company, customer_no, JSON.stringify(order_ids || []), user, timestamp],
-                    function(err) {
-                        if (err) {
-                            res.status(500).json({ error: err.message });
-                            return;
-                        }
-
-                        const paperworkId = this.lastID;
-
-                        // Add to history
-                        db.run(
-                            'INSERT INTO scan_history (paperwork_id, user_name, timestamp) VALUES (?, ?, ?)',
-                            [paperworkId, user, timestamp],
-                            (err) => {
-                                if (err) {
-                                    res.status(500).json({ error: err.message });
-                                    return;
-                                }
-                                res.json({ 
-                                    success: true, 
-                                    paperworkId,
-                                    message: 'New paperwork created',
-                                    company,
-                                    customer_no,
-                                    order_ids: order_ids || []
-                                });
-                            }
-                        );
+                        if (err) return res.status(500).json({ error: err.message });
+                        res.json({ 
+                            success: true, 
+                            message: 'Paperwork completed',
+                            completed_by: user,
+                            completed_at: timestamp
+                        });
                     }
                 );
             }
+        );
+    });
+});
+
+// Reopen completed paperwork
+app.post('/api/paperwork/:id/reopen', (req, res) => {
+    const { id } = req.params;
+    const { user } = req.body;
+
+    if (!user) return res.status(400).json({ error: 'User is required' });
+
+    const timestamp = new Date().toISOString();
+
+    db.run(
+        'UPDATE paperwork SET status = ?, completed_by = NULL, completed_at = NULL, current_holder = ?, last_scan = ? WHERE id = ?',
+        ['active', user, timestamp, id],
+        (err) => {
+            if (err) return res.status(500).json({ error: err.message });
+
+            db.run(
+                'INSERT INTO scan_history (paperwork_id, user_name, timestamp, action) VALUES (?, ?, ?, ?)',
+                [id, user, timestamp, 'reopened'],
+                (err) => {
+                    if (err) return res.status(500).json({ error: err.message });
+                    res.json({ success: true, message: 'Paperwork reopened' });
+                }
+            );
         }
     );
 });
 
-// Search paperwork
-app.get('/api/paperwork/search', (req, res) => {
-    const { q } = req.query;
-    
-    if (!q) {
-        res.status(400).json({ error: 'Search query required' });
-        return;
-    }
-
-    const searchTerm = `%${q}%`;
-    
-    db.all(
-        `SELECT * FROM paperwork 
-         WHERE company LIKE ? 
-         OR customer_no LIKE ? 
-         OR current_holder LIKE ?
-         ORDER BY last_scan DESC`,
-        [searchTerm, searchTerm, searchTerm],
-        (err, rows) => {
-            if (err) {
-                res.status(500).json({ error: err.message });
-                return;
-            }
-            res.json(rows);
-        }
-    );
+// Reset database (for testing)
+app.delete('/api/reset', (req, res) => {
+    db.serialize(() => {
+        db.run('DELETE FROM scan_history');
+        db.run('DELETE FROM paperwork');
+        db.run('DELETE FROM users');
+    });
+    res.json({ success: true, message: 'All data cleared' });
 });
 
 // Health check
@@ -311,19 +290,13 @@ app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Start server
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`Access the app at http://localhost:${PORT}`);
 });
 
-// Graceful shutdown
 process.on('SIGINT', () => {
-    db.close((err) => {
-        if (err) {
-            console.error(err.message);
-        }
-        console.log('Database connection closed');
+    db.close(() => {
+        console.log('Database closed');
         process.exit(0);
     });
 });
