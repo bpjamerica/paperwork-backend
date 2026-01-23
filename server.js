@@ -90,45 +90,97 @@ app.post('/api/users', (req, res) => {
     });
 });
 
-// Get all paperwork
+// Get all paperwork with history
 app.get('/api/paperwork', (req, res) => {
-    const query = `
-        SELECT p.*, GROUP_CONCAT(sh.user_name || '|' || sh.timestamp, '||') as history_data
-        FROM paperwork p
-        LEFT JOIN scan_history sh ON p.id = sh.paperwork_id
-        GROUP BY p.id
-        ORDER BY p.last_scan DESC
-    `;
-
-    db.all(query, [], (err, rows) => {
+    // First get all paperwork
+    db.all('SELECT * FROM paperwork ORDER BY last_scan DESC', [], (err, paperworkRows) => {
         if (err) {
             res.status(500).json({ error: err.message });
             return;
         }
 
-        const paperwork = rows.map(row => {
-            const history = [];
-            if (row.history_data) {
-                const entries = row.history_data.split('||');
-                entries.forEach(entry => {
-                    const [user, timestamp] = entry.split('|');
-                    history.push({ user, timestamp, action: 'scanned' });
-                });
+        if (paperworkRows.length === 0) {
+            res.json([]);
+            return;
+        }
+
+        // Get all history
+        db.all('SELECT * FROM scan_history ORDER BY timestamp ASC', [], (err, historyRows) => {
+            if (err) {
+                res.status(500).json({ error: err.message });
+                return;
             }
 
-            return {
-                id: row.id.toString(),
-                company: row.company,
-                customer_no: row.customer_no,
-                order_ids: row.order_ids ? JSON.parse(row.order_ids) : [],
-                current_holder: row.current_holder,
-                last_scan: row.last_scan,
-                created: row.created_at,
-                history
-            };
-        });
+            // Map history to paperwork
+            const paperwork = paperworkRows.map(row => {
+                const history = historyRows
+                    .filter(h => h.paperwork_id === row.id)
+                    .map(h => ({
+                        user: h.user_name,
+                        timestamp: h.timestamp,
+                        action: h.action || 'scanned'
+                    }));
 
-        res.json(paperwork);
+                return {
+                    id: row.id.toString(),
+                    company: row.company,
+                    customer_no: row.customer_no,
+                    order_ids: row.order_ids ? JSON.parse(row.order_ids) : [],
+                    current_holder: row.current_holder,
+                    last_scan: row.last_scan,
+                    created: row.created_at,
+                    history: history
+                };
+            });
+
+            res.json(paperwork);
+        });
+    });
+});
+
+// Get single paperwork by ID
+app.get('/api/paperwork/:id', (req, res) => {
+    const { id } = req.params;
+
+    db.get('SELECT * FROM paperwork WHERE id = ?', [id], (err, row) => {
+        if (err) {
+            res.status(500).json({ error: err.message });
+            return;
+        }
+
+        if (!row) {
+            res.status(404).json({ error: 'Paperwork not found' });
+            return;
+        }
+
+        // Get history for this paperwork
+        db.all(
+            'SELECT * FROM scan_history WHERE paperwork_id = ? ORDER BY timestamp ASC',
+            [id],
+            (err, historyRows) => {
+                if (err) {
+                    res.status(500).json({ error: err.message });
+                    return;
+                }
+
+                const history = historyRows.map(h => ({
+                    user: h.user_name,
+                    timestamp: h.timestamp,
+                    action: h.action || 'scanned'
+                }));
+
+                res.json({
+                    id: row.id.toString(),
+                    company: row.company,
+                    customer_no: row.customer_no,
+                    order_ids: row.order_ids ? JSON.parse(row.order_ids) : [],
+                    current_holder: row.current_holder,
+                    last_scan: row.last_scan,
+                    created: row.created_at,
+                    history: history
+                });
+            }
+        );
     });
 });
 
@@ -175,7 +227,14 @@ app.post('/api/scan', (req, res) => {
                                     res.status(500).json({ error: err.message });
                                     return;
                                 }
-                                res.json({ success: true, paperworkId });
+                                res.json({ 
+                                    success: true, 
+                                    paperworkId,
+                                    message: 'Paperwork updated',
+                                    company,
+                                    customer_no,
+                                    order_ids: order_ids || []
+                                });
                             }
                         );
                     }
@@ -202,7 +261,14 @@ app.post('/api/scan', (req, res) => {
                                     res.status(500).json({ error: err.message });
                                     return;
                                 }
-                                res.json({ success: true, paperworkId });
+                                res.json({ 
+                                    success: true, 
+                                    paperworkId,
+                                    message: 'New paperwork created',
+                                    company,
+                                    customer_no,
+                                    order_ids: order_ids || []
+                                });
                             }
                         );
                     }
