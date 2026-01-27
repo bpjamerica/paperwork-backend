@@ -1,10 +1,11 @@
-// server.js - Node.js Backend for Paperwork Tracker v4
-// Added: customer_name, rep_name fields
+// server.js - Node.js Backend for Paperwork Tracker v5
+// Added: PIN security for user authentication
 
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,16 +17,27 @@ app.use(express.json());
 // Database setup
 const db = new sqlite3.Database('./paperwork.db');
 
+// Hash PIN using SHA-256
+function hashPin(pin) {
+    return crypto.createHash('sha256').update(pin).digest('hex');
+}
+
 // Initialize database tables
 db.serialize(() => {
-    // Users table
+    // Users table with PIN support
     db.run(`
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
+            pin_hash TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
+
+    // Migration: Add pin_hash column if it doesn't exist
+    db.run(`ALTER TABLE users ADD COLUMN pin_hash TEXT`, (err) => {
+        // Ignore error if column already exists
+    });
 
     // Paperwork table - Added customer_name and rep_name
     db.run(`
@@ -86,7 +98,7 @@ app.get('/api/users', (req, res) => {
     });
 });
 
-// Add new user
+// Add new user (legacy - will create user without PIN)
 app.post('/api/users', (req, res) => {
     const { name } = req.body;
     if (!name) {
@@ -100,6 +112,160 @@ app.post('/api/users', (req, res) => {
             return;
         }
         res.json({ id: this.lastID, name: name });
+    });
+});
+
+// Register new user with PIN
+app.post('/api/users/register', (req, res) => {
+    const { name, pin } = req.body;
+
+    if (!name) {
+        res.status(400).json({ error: 'Name is required' });
+        return;
+    }
+
+    if (!pin || !/^\d{4}$/.test(pin)) {
+        res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+        return;
+    }
+
+    const pinHash = hashPin(pin);
+
+    // Check if user already exists
+    db.get('SELECT id, pin_hash FROM users WHERE name = ?', [name], (err, existingUser) => {
+        if (err) {
+            res.status(500).json({ error: err.message });
+            return;
+        }
+
+        if (existingUser) {
+            res.status(400).json({ error: 'User already exists. Please login instead.' });
+            return;
+        }
+
+        // Create new user with PIN
+        db.run('INSERT INTO users (name, pin_hash) VALUES (?, ?)', [name, pinHash], function(err) {
+            if (err) {
+                res.status(500).json({ error: err.message });
+                return;
+            }
+            res.json({ success: true, id: this.lastID, name: name });
+        });
+    });
+});
+
+// Login user with PIN
+app.post('/api/users/login', (req, res) => {
+    const { name, pin } = req.body;
+
+    if (!name) {
+        res.status(400).json({ error: 'Name is required' });
+        return;
+    }
+
+    db.get('SELECT id, name, pin_hash FROM users WHERE name = ?', [name], (err, user) => {
+        if (err) {
+            res.status(500).json({ error: err.message });
+            return;
+        }
+
+        if (!user) {
+            res.status(404).json({ error: 'User not found' });
+            return;
+        }
+
+        // Check if user has a PIN set
+        if (!user.pin_hash) {
+            // User exists but has no PIN - needs to set one
+            res.json({
+                success: true,
+                needsPin: true,
+                id: user.id,
+                name: user.name,
+                message: 'Please set a PIN for your account'
+            });
+            return;
+        }
+
+        // Verify PIN
+        if (!pin) {
+            res.status(400).json({ error: 'PIN is required' });
+            return;
+        }
+
+        const pinHash = hashPin(pin);
+        if (pinHash !== user.pin_hash) {
+            res.status(401).json({ error: 'Incorrect PIN' });
+            return;
+        }
+
+        res.json({ success: true, id: user.id, name: user.name });
+    });
+});
+
+// Set PIN for existing user without one
+app.post('/api/users/set-pin', (req, res) => {
+    const { name, pin } = req.body;
+
+    if (!name) {
+        res.status(400).json({ error: 'Name is required' });
+        return;
+    }
+
+    if (!pin || !/^\d{4}$/.test(pin)) {
+        res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+        return;
+    }
+
+    db.get('SELECT id, pin_hash FROM users WHERE name = ?', [name], (err, user) => {
+        if (err) {
+            res.status(500).json({ error: err.message });
+            return;
+        }
+
+        if (!user) {
+            res.status(404).json({ error: 'User not found' });
+            return;
+        }
+
+        if (user.pin_hash) {
+            res.status(400).json({ error: 'User already has a PIN set' });
+            return;
+        }
+
+        const pinHash = hashPin(pin);
+        db.run('UPDATE users SET pin_hash = ? WHERE id = ?', [pinHash, user.id], function(err) {
+            if (err) {
+                res.status(500).json({ error: err.message });
+                return;
+            }
+            res.json({ success: true, message: 'PIN set successfully' });
+        });
+    });
+});
+
+// Admin endpoint to reset a user's PIN (for forgotten PIN recovery)
+app.post('/api/users/:name/reset-pin', (req, res) => {
+    const { name } = req.params;
+
+    db.get('SELECT id FROM users WHERE name = ?', [name], (err, user) => {
+        if (err) {
+            res.status(500).json({ error: err.message });
+            return;
+        }
+
+        if (!user) {
+            res.status(404).json({ error: 'User not found' });
+            return;
+        }
+
+        db.run('UPDATE users SET pin_hash = NULL WHERE id = ?', [user.id], function(err) {
+            if (err) {
+                res.status(500).json({ error: err.message });
+                return;
+            }
+            res.json({ success: true, message: `PIN reset for ${name}. User will be prompted to set a new PIN on next login.` });
+        });
     });
 });
 
