@@ -578,6 +578,91 @@ app.post('/api/paperwork/:id/transfer', (req, res) => {
     );
 });
 
+// Backup all data (export as JSON)
+app.get('/api/backup', (req, res) => {
+    const backup = {};
+
+    db.all('SELECT * FROM users', [], (err, users) => {
+        if (err) {
+            res.status(500).json({ error: err.message });
+            return;
+        }
+        backup.users = users;
+
+        db.all('SELECT * FROM paperwork', [], (err, paperwork) => {
+            if (err) {
+                res.status(500).json({ error: err.message });
+                return;
+            }
+            backup.paperwork = paperwork;
+
+            db.all('SELECT * FROM scan_history', [], (err, history) => {
+                if (err) {
+                    res.status(500).json({ error: err.message });
+                    return;
+                }
+                backup.scan_history = history;
+                backup.exported_at = new Date().toISOString();
+                backup.version = '1.0';
+
+                res.setHeader('Content-Disposition', 'attachment; filename=paperwork-backup.json');
+                res.json(backup);
+            });
+        });
+    });
+});
+
+// Restore data from backup
+app.post('/api/restore', (req, res) => {
+    const { users, paperwork, scan_history } = req.body;
+
+    if (!users || !paperwork || !scan_history) {
+        res.status(400).json({ error: 'Invalid backup format. Must include users, paperwork, and scan_history arrays.' });
+        return;
+    }
+
+    db.serialize(() => {
+        // Clear existing data
+        db.run('DELETE FROM scan_history');
+        db.run('DELETE FROM paperwork');
+        db.run('DELETE FROM users');
+
+        // Restore users
+        const userStmt = db.prepare('INSERT INTO users (id, name, pin_hash, created_at) VALUES (?, ?, ?, ?)');
+        users.forEach(u => {
+            userStmt.run(u.id, u.name, u.pin_hash, u.created_at);
+        });
+        userStmt.finalize();
+
+        // Restore paperwork
+        const paperworkStmt = db.prepare(`
+            INSERT INTO paperwork (id, company, customer_no, customer_name, rep_name, order_ids, current_holder, status, created_at, completed_at, completed_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        paperwork.forEach(p => {
+            paperworkStmt.run(p.id, p.company, p.customer_no, p.customer_name, p.rep_name, p.order_ids, p.current_holder, p.status, p.created_at, p.completed_at, p.completed_by);
+        });
+        paperworkStmt.finalize();
+
+        // Restore scan history
+        const historyStmt = db.prepare('INSERT INTO scan_history (id, paperwork_id, user_name, action, timestamp) VALUES (?, ?, ?, ?, ?)');
+        scan_history.forEach(h => {
+            historyStmt.run(h.id, h.paperwork_id, h.user_name, h.action, h.timestamp);
+        });
+        historyStmt.finalize();
+
+        res.json({
+            success: true,
+            message: 'Data restored successfully',
+            counts: {
+                users: users.length,
+                paperwork: paperwork.length,
+                scan_history: scan_history.length
+            }
+        });
+    });
+});
+
 // Reset database (for testing)
 app.delete('/api/reset', (req, res) => {
     db.serialize(() => {
