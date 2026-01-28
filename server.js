@@ -22,6 +22,20 @@ function hashPin(pin) {
     return crypto.createHash('sha256').update(pin).digest('hex');
 }
 
+// Get current timestamp in Central Time
+function getCentralTime() {
+    return new Date().toLocaleString('en-US', {
+        timeZone: 'America/Chicago',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+    }).replace(/(\d+)\/(\d+)\/(\d+),/, '$3-$1-$2');
+}
+
 // Initialize database tables
 db.serialize(() => {
     // Users table with PIN support
@@ -144,7 +158,7 @@ app.post('/api/users/register', (req, res) => {
         }
 
         // Create new user with PIN
-        db.run('INSERT INTO users (name, pin_hash) VALUES (?, ?)', [name, pinHash], function(err) {
+        db.run('INSERT INTO users (name, pin_hash, created_at) VALUES (?, ?, ?)', [name, pinHash, getCentralTime()], function(err) {
             if (err) {
                 res.status(500).json({ error: err.message });
                 return;
@@ -381,8 +395,8 @@ app.post('/api/scan', (req, res) => {
 
                         // Add to history
                         db.run(
-                            'INSERT INTO scan_history (paperwork_id, user_name, action) VALUES (?, ?, ?)',
-                            [existing.id, user_name, 'transfer'],
+                            'INSERT INTO scan_history (paperwork_id, user_name, action, timestamp) VALUES (?, ?, ?, ?)',
+                            [existing.id, user_name, 'transfer', getCentralTime()],
                             function(err) {
                                 if (err) {
                                     res.status(500).json({ error: err.message });
@@ -404,9 +418,9 @@ app.post('/api/scan', (req, res) => {
                 const orderIdsJson = JSON.stringify(order_ids || []);
 
                 db.run(
-                    `INSERT INTO paperwork (company, customer_no, customer_name, rep_name, order_ids, current_holder, status)
-                     VALUES (?, ?, ?, ?, ?, ?, 'active')`,
-                    [company, customer_no, customer_name || '', rep_name || '', orderIdsJson, user_name],
+                    `INSERT INTO paperwork (company, customer_no, customer_name, rep_name, order_ids, current_holder, status, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
+                    [company, customer_no, customer_name || '', rep_name || '', orderIdsJson, user_name, getCentralTime()],
                     function(err) {
                         if (err) {
                             res.status(500).json({ error: err.message });
@@ -417,8 +431,8 @@ app.post('/api/scan', (req, res) => {
 
                         // Add to history as 'created'
                         db.run(
-                            'INSERT INTO scan_history (paperwork_id, user_name, action) VALUES (?, ?, ?)',
-                            [paperworkId, user_name, 'created'],
+                            'INSERT INTO scan_history (paperwork_id, user_name, action, timestamp) VALUES (?, ?, ?, ?)',
+                            [paperworkId, user_name, 'created', getCentralTime()],
                             function(err) {
                                 if (err) {
                                     res.status(500).json({ error: err.message });
@@ -452,9 +466,9 @@ app.post('/api/paperwork/:id/complete', (req, res) => {
 
     db.run(
         `UPDATE paperwork
-         SET status = 'completed', completed_at = CURRENT_TIMESTAMP, completed_by = ?
+         SET status = 'completed', completed_at = ?, completed_by = ?
          WHERE id = ?`,
-        [user_name, id],
+        [getCentralTime(), user_name, id],
         function(err) {
             if (err) {
                 res.status(500).json({ error: err.message });
@@ -463,8 +477,8 @@ app.post('/api/paperwork/:id/complete', (req, res) => {
 
             // Add to history
             db.run(
-                'INSERT INTO scan_history (paperwork_id, user_name, action) VALUES (?, ?, ?)',
-                [id, user_name, 'completed'],
+                'INSERT INTO scan_history (paperwork_id, user_name, action, timestamp) VALUES (?, ?, ?, ?)',
+                [id, user_name, 'completed', getCentralTime()],
                 function(err) {
                     if (err) {
                         res.status(500).json({ error: err.message });
@@ -524,8 +538,8 @@ app.post('/api/paperwork/:id/reopen', (req, res) => {
 
                         // Add to history
                         db.run(
-                            'INSERT INTO scan_history (paperwork_id, user_name, action) VALUES (?, ?, ?)',
-                            [id, user_name, 'reopened'],
+                            'INSERT INTO scan_history (paperwork_id, user_name, action, timestamp) VALUES (?, ?, ?, ?)',
+                            [id, user_name, 'reopened', getCentralTime()],
                             function(err) {
                                 if (err) {
                                     res.status(500).json({ error: err.message });
@@ -563,8 +577,8 @@ app.post('/api/paperwork/:id/transfer', (req, res) => {
 
             // Add to history
             db.run(
-                'INSERT INTO scan_history (paperwork_id, user_name, action) VALUES (?, ?, ?)',
-                [id, user_name, 'transfer'],
+                'INSERT INTO scan_history (paperwork_id, user_name, action, timestamp) VALUES (?, ?, ?, ?)',
+                [id, user_name, 'transfer', getCentralTime()],
                 function(err) {
                     if (err) {
                         res.status(500).json({ error: err.message });
@@ -602,7 +616,7 @@ app.get('/api/backup', (req, res) => {
                     return;
                 }
                 backup.scan_history = history;
-                backup.exported_at = new Date().toISOString();
+                backup.exported_at = getCentralTime();
                 backup.version = '1.0';
 
                 res.setHeader('Content-Disposition', 'attachment; filename=paperwork-backup.json');
